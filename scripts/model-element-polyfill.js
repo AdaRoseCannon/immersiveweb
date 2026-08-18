@@ -39826,15 +39826,15 @@ let sharedRenderer = null;
 let offscreenCanvas = null;
 const renderCallbacks = /* @__PURE__ */ new Map();
 let sharedAnimationId = null;
+function createWebGLRenderer(canvas) {
+  const r = new WebGLRenderer({ canvas, antialias: true, alpha: true });
+  r.setPixelRatio(window.devicePixelRatio);
+  return r;
+}
 function getSharedRenderer() {
   if (sharedRenderer) return sharedRenderer;
   offscreenCanvas = document.createElement("canvas");
-  sharedRenderer = new WebGLRenderer({
-    canvas: offscreenCanvas,
-    antialias: true,
-    alpha: true
-  });
-  sharedRenderer.setPixelRatio(window.devicePixelRatio);
+  sharedRenderer = createWebGLRenderer(offscreenCanvas);
   return sharedRenderer;
 }
 function registerElement(element, renderCallback) {
@@ -40114,10 +40114,9 @@ function computeScreenFrustum(rect, m) {
     height: rect.height
   };
 }
-function computeScreenPortalCenter(rect, m) {
-  const f = computeScreenFrustum(rect, m);
-  const centerXpx = f.offsetX + rect.width / 2;
-  const centerYpx = f.offsetY + rect.height / 2;
+function portalCenterFromFrustum(f) {
+  const centerXpx = f.offsetX + f.width / 2;
+  const centerYpx = f.offsetY + f.height / 2;
   const screenWidthM = f.fullWidth / CSS_PIXELS_PER_CM / 100;
   const screenHeightM = f.fullHeight / CSS_PIXELS_PER_CM / 100;
   return {
@@ -40132,21 +40131,27 @@ function calculateFOVForViewport(cameraDistance) {
   const halfFovRad = Math.atan(screenHeightMeters / (2 * cameraDistance));
   return 2 * halfFovRad * (180 / Math.PI);
 }
-function applyUnifiedViewOffset(element, camera) {
+function applyUnifiedViewOffsetFromFrustum(camera, f) {
   if (!camera) return;
-  const f = computeScreenFrustum(element.getBoundingClientRect(), readWindowMetrics());
   camera.setViewOffset(f.fullWidth, f.fullHeight, f.offsetX, f.offsetY, f.width, f.height);
   camera.aspect = f.fullWidth / f.fullHeight;
   camera.updateProjectionMatrix();
 }
-function getPortalCenter3D(element) {
-  return computeScreenPortalCenter(element.getBoundingClientRect(), readWindowMetrics());
-}
-function updateUnifiedTranslation(element, portalGroup) {
+function updateUnifiedTranslationFromFrustum(portalGroup, f) {
   if (!portalGroup) return;
-  const portalCenter = getPortalCenter3D(element);
+  const portalCenter = portalCenterFromFrustum(f);
   portalGroup.position.x = portalCenter.x;
   portalGroup.position.y = portalCenter.y;
+}
+function applyUnifiedFrame(element, camera, portalGroup) {
+  const f = computeScreenFrustum(element.getBoundingClientRect(), readWindowMetrics());
+  applyUnifiedViewOffsetFromFrustum(camera, f);
+  if (portalGroup) updateUnifiedTranslationFromFrustum(portalGroup, f);
+}
+function applyUnifiedViewOffset(element, camera) {
+  if (!camera) return;
+  const f = computeScreenFrustum(element.getBoundingClientRect(), readWindowMetrics());
+  applyUnifiedViewOffsetFromFrustum(camera, f);
 }
 const DEFAULT_CAMERA_DISTANCE = 0.3;
 function parseConfig(url) {
@@ -40199,10 +40204,7 @@ async function maybeStartStereo(element, state) {
   try {
     await enterStereo(element, state, false);
   } catch (err2) {
-    try {
-      exitStereo(element, state);
-    } catch {
-    }
+    exitStereo(element, state);
     console.debug("inline-stereo unavailable, staying on unified fallback", err2);
   }
 }
@@ -40213,6 +40215,7 @@ async function enterStereo(element, state, withTracking) {
   if (!state.xrCanvas) {
     state.xrCanvas = document.createElement("canvas");
     state.xrCanvas.className = XR_CANVAS_CLASS;
+    state.xrCanvas.setAttribute("data-model-internal", "");
     state.xrCanvas.style.width = "100%";
     state.xrCanvas.style.height = "100%";
     state.xrCanvas.style.display = "block";
@@ -40220,10 +40223,8 @@ async function enterStereo(element, state, withTracking) {
   }
   if (state.canvas) state.canvas.style.display = "none";
   if (!state.xrRenderer) {
-    state.xrRenderer = new WebGLRenderer({ canvas: state.xrCanvas, alpha: true, antialias: true });
-    state.xrRenderer.setPixelRatio(window.devicePixelRatio);
-    const width = element.clientWidth || 400;
-    const height = element.clientHeight || 300;
+    state.xrRenderer = createWebGLRenderer(state.xrCanvas);
+    const { width, height } = getElementSize(element);
     state.xrRenderer.setSize(width, height, false);
     state.xrRenderer.xr.enabled = true;
   }
@@ -40251,7 +40252,7 @@ function onStereoSessionEnded(element, state, session) {
   if (state._stereoTransitioning) return;
   exitStereo(element, state);
 }
-function exitStereo(element, state) {
+function exitStereo(element, state, { removeButton = false } = {}) {
   if (state.xrRenderer) {
     try {
       state.xrRenderer.setAnimationLoop(null);
@@ -40282,7 +40283,14 @@ function exitStereo(element, state) {
   if (state.camera) state.camera.position.set(0, 0, CAMERA_DISTANCE$1);
   state.renderMode = "unified";
   state.stereoMode = "off";
-  if (state.stereoButton) state.stereoButton.style.display = "none";
+  if (removeButton) {
+    if (state.stereoButton) {
+      state.stereoButton.remove();
+      state.stereoButton = null;
+    }
+  } else if (state.stereoButton) {
+    state.stereoButton.style.display = "none";
+  }
   reRegisterUnified(element, state);
 }
 function ensureStereoButton(element, state) {
@@ -40292,6 +40300,7 @@ function ensureStereoButton(element, state) {
   }
   const button = document.createElement("button");
   button.className = STEREO_BUTTON_CLASS;
+  button.setAttribute("data-model-internal", "");
   button.textContent = stereoButtonLabel(state.stereoMode || "fixed");
   Object.assign(button.style, {
     position: "absolute",
@@ -40315,26 +40324,29 @@ async function onStereoButtonClick(element, state) {
   if (state._stereoTransitioning) return;
   const goingToTracked = state.stereoMode === "fixed";
   state._stereoTransitioning = true;
-  try {
-    if (state.xrSession) {
-      try {
-        await state.xrSession.end?.();
-      } catch {
-      }
-      state.xrSession = null;
+  if (state.xrSession) {
+    try {
+      await state.xrSession.end?.();
+    } catch {
     }
-    if (goingToTracked) {
-      try {
-        await enterStereo(element, state, true);
-      } catch (err2) {
+    state.xrSession = null;
+  }
+  const modes = goingToTracked ? [true, false] : [false];
+  let entered = false;
+  for (let i = 0; i < modes.length; i++) {
+    try {
+      await enterStereo(element, state, modes[i]);
+      entered = true;
+      break;
+    } catch (err2) {
+      if (modes[i] === true) {
         console.debug("tracked stereo request failed, restarting fixed", err2);
-        await enterStereo(element, state, false);
+      } else {
+        console.debug("stereo transition failed, reverting to unified", err2);
       }
-    } else {
-      await enterStereo(element, state, false);
     }
-  } catch (err2) {
-    console.debug("stereo transition failed, reverting to unified", err2);
+  }
+  if (!entered) {
     state._stereoTransitioning = false;
     exitStereo(element, state);
     return;
@@ -40429,9 +40441,13 @@ function createSpatialContext(element) {
   spatialContextMap.set(element, state);
   return state;
 }
+function getElementSize(element) {
+  return { width: element.clientWidth || 400, height: element.clientHeight || 300 };
+}
 function initSpatialContext(element, state) {
   state.canvas = document.createElement("canvas");
   state.canvas.className = "__model-element-fallback-canvas-f7a9c3e1__";
+  state.canvas.setAttribute("data-model-internal", "");
   state.canvas.style.width = "100%";
   state.canvas.style.height = "100%";
   state.canvas.style.display = "block";
@@ -40439,8 +40455,7 @@ function initSpatialContext(element, state) {
   state.blitCtx = state.canvas.getContext("2d");
   state.blitCtx.imageSmoothingEnabled = false;
   state.renderMode = "unified";
-  const width = element.clientWidth || 400;
-  const height = element.clientHeight || 300;
+  const { width, height } = getElementSize(element);
   const dpr = window.devicePixelRatio;
   state.canvas.width = Math.round(width * dpr);
   state.canvas.height = Math.round(height * dpr);
@@ -40462,12 +40477,8 @@ function reRegisterUnified(element, state) {
 }
 function destroySpatialContext(element, state) {
   if (state.stereoMode !== "off") {
-    try {
-      exitStereo(element, state);
-    } catch {
-    }
-  }
-  if (state.stereoButton) {
+    exitStereo(element, state, { removeButton: true });
+  } else if (state.stereoButton) {
     state.stereoButton.remove();
     state.stereoButton = null;
   }
@@ -40694,8 +40705,7 @@ function renderAndBlit(element, state, renderer) {
   if (currentDevWidth !== width || currentDevHeight !== height) {
     renderer.setSize(cssWidth, cssHeight, false);
   }
-  if (state.renderMode === "unified") applyUnifiedViewOffset(element, state.camera);
-  if (state.renderMode === "unified") updateUnifiedTranslation(element, state.portalGroup);
+  if (state.renderMode === "unified") applyUnifiedFrame(element, state.camera, state.portalGroup);
   renderer.render(state.scene, state.camera);
   const srcWidth = renderer.domElement.width;
   const srcHeight = renderer.domElement.height;
@@ -41407,8 +41417,8 @@ function applyFallback(el) {
         overflow: hidden;
         contain: strict;
       }
-      model > *:not(.__model-element-fallback-canvas-f7a9c3e1__):not(.__model-element-stereo-button-f7a9c3e1__):not(source),
-      model-polyfill > *:not(.__model-element-fallback-canvas-f7a9c3e1__):not(.__model-element-stereo-button-f7a9c3e1__):not(source) {
+      model > *:not([data-model-internal]):not(source),
+      model-polyfill > *:not([data-model-internal]):not(source) {
         display: none !important;
       }
     `;
