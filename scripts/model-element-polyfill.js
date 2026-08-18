@@ -40088,33 +40088,59 @@ function updateEntityTransformFromOrbit(state, applyEntityTransform2) {
   state.entityTransform = buildTransformMatrix(scale, finalZ, state.orbitQuaternion, center);
   applyEntityTransform2();
 }
+function readWindowMetrics() {
+  return {
+    screenWidth: window.screen.width,
+    screenHeight: window.screen.height,
+    screenX: window.screenX,
+    screenY: window.screenY,
+    outerWidth: window.outerWidth,
+    outerHeight: window.outerHeight,
+    innerWidth: window.innerWidth,
+    innerHeight: window.innerHeight
+  };
+}
+function computeScreenFrustum(rect, m) {
+  const chromeLeft = (m.outerWidth - m.innerWidth) / 2;
+  const chromeTop = m.outerHeight - m.innerHeight;
+  const contentLeft = m.screenX + chromeLeft;
+  const contentTop = m.screenY + chromeTop;
+  return {
+    fullWidth: m.screenWidth,
+    fullHeight: m.screenHeight,
+    offsetX: contentLeft + rect.left,
+    offsetY: contentTop + rect.top,
+    width: rect.width,
+    height: rect.height
+  };
+}
+function computeScreenPortalCenter(rect, m) {
+  const f = computeScreenFrustum(rect, m);
+  const centerXpx = f.offsetX + rect.width / 2;
+  const centerYpx = f.offsetY + rect.height / 2;
+  const screenWidthM = f.fullWidth / CSS_PIXELS_PER_CM / 100;
+  const screenHeightM = f.fullHeight / CSS_PIXELS_PER_CM / 100;
+  return {
+    x: centerXpx / CSS_PIXELS_PER_CM / 100 - screenWidthM / 2,
+    y: screenHeightM / 2 - centerYpx / CSS_PIXELS_PER_CM / 100
+  };
+}
 function calculateFOVForViewport(cameraDistance) {
-  const viewportHeight = document.documentElement.clientHeight;
-  const viewportHeightCm = viewportHeight / CSS_PIXELS_PER_CM;
-  const viewportHeightMeters = viewportHeightCm / 100;
-  const halfFovRad = Math.atan(viewportHeightMeters / (2 * cameraDistance));
+  const screenHeight = window.screen.height;
+  const screenHeightCm = screenHeight / CSS_PIXELS_PER_CM;
+  const screenHeightMeters = screenHeightCm / 100;
+  const halfFovRad = Math.atan(screenHeightMeters / (2 * cameraDistance));
   return 2 * halfFovRad * (180 / Math.PI);
 }
 function applyUnifiedViewOffset(element, camera) {
   if (!camera) return;
-  const rect = element.getBoundingClientRect();
-  const fullWidth = document.documentElement.clientWidth;
-  const fullHeight = document.documentElement.clientHeight;
-  camera.setViewOffset(fullWidth, fullHeight, rect.left, rect.top, rect.width, rect.height);
-  camera.aspect = fullWidth / fullHeight;
+  const f = computeScreenFrustum(element.getBoundingClientRect(), readWindowMetrics());
+  camera.setViewOffset(f.fullWidth, f.fullHeight, f.offsetX, f.offsetY, f.width, f.height);
+  camera.aspect = f.fullWidth / f.fullHeight;
   camera.updateProjectionMatrix();
 }
 function getPortalCenter3D(element) {
-  const rect = element.getBoundingClientRect();
-  const viewportWidth = document.documentElement.clientWidth;
-  const viewportHeight = document.documentElement.clientHeight;
-  const viewportWidthM = viewportWidth / CSS_PIXELS_PER_CM / 100;
-  const viewportHeightM = viewportHeight / CSS_PIXELS_PER_CM / 100;
-  const portalCenterX_px = rect.left + rect.width / 2;
-  const portalCenterY_px = rect.top + rect.height / 2;
-  const x = portalCenterX_px / CSS_PIXELS_PER_CM / 100 - viewportWidthM / 2;
-  const y = viewportHeightM / 2 - portalCenterY_px / CSS_PIXELS_PER_CM / 100;
-  return { x, y };
+  return computeScreenPortalCenter(element.getBoundingClientRect(), readWindowMetrics());
 }
 function updateUnifiedTranslation(element, portalGroup) {
   if (!portalGroup) return;
@@ -40143,6 +40169,179 @@ function parseConfig(url) {
   return { cameraDistance, unifiedFrustum };
 }
 const config = Object.freeze(parseConfig(import.meta.url));
+const CAMERA_DISTANCE$1 = config.cameraDistance;
+const STEREO_BUTTON_CLASS = "__model-element-stereo-button-f7a9c3e1__";
+const XR_CANVAS_CLASS = "__model-element-fallback-canvas-f7a9c3e1__";
+let _support = null;
+function detectInlineStereo() {
+  if (_support) return _support;
+  _support = (async () => {
+    if (typeof navigator === "undefined" || !navigator.xr) return false;
+    try {
+      return await navigator.xr.isSessionSupported("inline");
+    } catch {
+      return false;
+    }
+  })();
+  return _support;
+}
+function requestInlineStereoSession(withTracking) {
+  const requiredFeatures = ["inline-stereo"];
+  if (withTracking) requiredFeatures.push("local");
+  return navigator.xr.requestSession("inline", { requiredFeatures });
+}
+function stereoButtonLabel(stereoMode) {
+  return stereoMode === "tracked" ? "Exit tracked stereo" : "View in tracked stereo";
+}
+async function maybeStartStereo(element, state) {
+  if (typeof navigator === "undefined" || !navigator.xr) return;
+  if (!await detectInlineStereo()) return;
+  try {
+    await enterStereo(element, state, false);
+  } catch (err2) {
+    try {
+      exitStereo(element, state);
+    } catch {
+    }
+    console.debug("inline-stereo unavailable, staying on unified fallback", err2);
+  }
+}
+async function enterStereo(element, state, withTracking) {
+  const session = await requestInlineStereoSession(withTracking);
+  unregisterElement(element);
+  state.renderMode = "stereo";
+  if (!state.xrCanvas) {
+    state.xrCanvas = document.createElement("canvas");
+    state.xrCanvas.className = XR_CANVAS_CLASS;
+    state.xrCanvas.style.width = "100%";
+    state.xrCanvas.style.height = "100%";
+    state.xrCanvas.style.display = "block";
+    element.appendChild(state.xrCanvas);
+  }
+  if (state.canvas) state.canvas.style.display = "none";
+  if (!state.xrRenderer) {
+    state.xrRenderer = new WebGLRenderer({ canvas: state.xrCanvas, alpha: true, antialias: true });
+    state.xrRenderer.setPixelRatio(window.devicePixelRatio);
+    const width = element.clientWidth || 400;
+    const height = element.clientHeight || 300;
+    state.xrRenderer.setSize(width, height, false);
+    state.xrRenderer.xr.enabled = true;
+  }
+  state.xrRenderer.xr.setReferenceSpaceType(withTracking ? "local" : "viewer");
+  await state.xrRenderer.xr.setSession(session);
+  if (state.portalGroup) state.portalGroup.position.set(0, 0, -CAMERA_DISTANCE$1);
+  if (state.camera) {
+    state.camera.position.set(0, 0, 0);
+    state.camera.updateMatrixWorld?.();
+  }
+  state.xrRenderer.setAnimationLoop(() => {
+    state.onFrameTick?.(element, state.xrRenderer);
+    state.xrRenderer.render(state.scene, state.camera);
+  });
+  state.xrSession = session;
+  state.stereoMode = withTracking ? "tracked" : "fixed";
+  if (typeof session.addEventListener === "function") {
+    session.addEventListener("end", () => onStereoSessionEnded(element, state, session));
+  }
+  ensureStereoButton(element, state);
+  if (state.stereoButton) state.stereoButton.textContent = stereoButtonLabel(state.stereoMode);
+}
+function onStereoSessionEnded(element, state, session) {
+  if (session !== state.xrSession) return;
+  if (state._stereoTransitioning) return;
+  exitStereo(element, state);
+}
+function exitStereo(element, state) {
+  if (state.xrRenderer) {
+    try {
+      state.xrRenderer.setAnimationLoop(null);
+    } catch {
+    }
+  }
+  if (state.xrSession) {
+    try {
+      state.xrSession.end?.().catch?.(() => {
+      });
+    } catch {
+    }
+    state.xrSession = null;
+  }
+  if (state.xrRenderer) {
+    try {
+      state.xrRenderer.dispose();
+    } catch {
+    }
+    state.xrRenderer = null;
+  }
+  if (state.xrCanvas) {
+    state.xrCanvas.remove();
+    state.xrCanvas = null;
+  }
+  if (state.canvas) state.canvas.style.display = "block";
+  state.portalGroup?.position.set(0, 0, 0);
+  if (state.camera) state.camera.position.set(0, 0, CAMERA_DISTANCE$1);
+  state.renderMode = "unified";
+  state.stereoMode = "off";
+  if (state.stereoButton) state.stereoButton.style.display = "none";
+  reRegisterUnified(element, state);
+}
+function ensureStereoButton(element, state) {
+  if (state.stereoButton) {
+    state.stereoButton.style.display = "";
+    return state.stereoButton;
+  }
+  const button = document.createElement("button");
+  button.className = STEREO_BUTTON_CLASS;
+  button.textContent = stereoButtonLabel(state.stereoMode || "fixed");
+  Object.assign(button.style, {
+    position: "absolute",
+    bottom: "8px",
+    right: "8px",
+    zIndex: "2",
+    padding: "4px 10px",
+    font: "13px system-ui, sans-serif",
+    color: "#fff",
+    background: "rgba(0, 0, 0, 0.55)",
+    border: "1px solid rgba(255, 255, 255, 0.35)",
+    borderRadius: "6px",
+    cursor: "pointer"
+  });
+  button.addEventListener("click", () => onStereoButtonClick(element, state));
+  element.appendChild(button);
+  state.stereoButton = button;
+  return button;
+}
+async function onStereoButtonClick(element, state) {
+  if (state._stereoTransitioning) return;
+  const goingToTracked = state.stereoMode === "fixed";
+  state._stereoTransitioning = true;
+  try {
+    if (state.xrSession) {
+      try {
+        await state.xrSession.end?.();
+      } catch {
+      }
+      state.xrSession = null;
+    }
+    if (goingToTracked) {
+      try {
+        await enterStereo(element, state, true);
+      } catch (err2) {
+        console.debug("tracked stereo request failed, restarting fixed", err2);
+        await enterStereo(element, state, false);
+      }
+    } else {
+      await enterStereo(element, state, false);
+    }
+  } catch (err2) {
+    console.debug("stereo transition failed, reverting to unified", err2);
+    state._stereoTransitioning = false;
+    exitStereo(element, state);
+    return;
+  }
+  state._stereoTransitioning = false;
+  if (state.stereoButton) state.stereoButton.textContent = stereoButtonLabel(state.stereoMode);
+}
 const sharedHDRLoader = new HDRLoader();
 const CAMERA_DISTANCE = config.cameraDistance;
 const _rendererSize = new Vector2();
@@ -40171,6 +40370,17 @@ function createSpatialContext(element) {
     isVisible: false,
     entityTransform: new DOMMatrixReadOnly(),
     userSetEntityTransform: false,
+    // Per-element render mode: 'standard' | 'unified' | 'stereo'.
+    // Only 'unified' triggers the setViewOffset / portal-translation path.
+    // 'stereo' is reserved for a later stage and behaves like 'standard' here.
+    renderMode: "standard",
+    // WebXR inline-stereo state (see inline-stereo.js).
+    // stereoMode: 'off' | 'fixed' | 'tracked'.
+    stereoMode: "off",
+    xrSession: null,
+    xrRenderer: null,
+    xrCanvas: null,
+    stereoButton: null,
     // Bounding box
     boundingBoxCenter: new DOMPointReadOnly(0, 0, 0, 1),
     boundingBoxExtents: new DOMPointReadOnly(0, 0, 0, 0),
@@ -40228,6 +40438,7 @@ function initSpatialContext(element, state) {
   element.appendChild(state.canvas);
   state.blitCtx = state.canvas.getContext("2d");
   state.blitCtx.imageSmoothingEnabled = false;
+  state.renderMode = "unified";
   const width = element.clientWidth || 400;
   const height = element.clientHeight || 300;
   const dpr = window.devicePixelRatio;
@@ -40237,15 +40448,29 @@ function initSpatialContext(element, state) {
   state.scene.background = null;
   state.canvas.style.background = "Canvas";
   state.scene.environment = createDefaultEnvironmentMap();
-  const fov2 = config.unifiedFrustum ? calculateFOVForViewport(CAMERA_DISTANCE) : calculateStandardFOV(element);
+  const fov2 = state.renderMode === "unified" ? calculateFOVForViewport(CAMERA_DISTANCE) : calculateStandardFOV(element);
   state.camera = new PerspectiveCamera(fov2, width / height, CAMERA_DISTANCE * 0.5, 100 + CAMERA_DISTANCE);
   state.camera.position.set(0, 0, CAMERA_DISTANCE);
   state.resizeObserver = new ResizeObserver(() => handleSpatialResize(element, state));
   state.resizeObserver.observe(element);
   spatialIntersectionObserver.observe(element);
   registerElement(element, (renderer) => renderFrame(element, state, renderer));
+  maybeStartStereo(element, state);
+}
+function reRegisterUnified(element, state) {
+  registerElement(element, (renderer) => renderFrame(element, state, renderer));
 }
 function destroySpatialContext(element, state) {
+  if (state.stereoMode !== "off") {
+    try {
+      exitStereo(element, state);
+    } catch {
+    }
+  }
+  if (state.stereoButton) {
+    state.stereoButton.remove();
+    state.stereoButton = null;
+  }
   unregisterElement(element);
   disableOrbitControls(element, state);
   spatialIntersectionObserver.unobserve(element);
@@ -40418,7 +40643,7 @@ function updateStandardCamera(element, state) {
   const width = element.clientWidth;
   const height = element.clientHeight;
   if (width === 0 || height === 0) return;
-  if (config.unifiedFrustum) {
+  if (state.renderMode === "unified") {
     state.camera.fov = calculateFOVForViewport(CAMERA_DISTANCE);
     applyUnifiedViewOffset(element, state.camera);
   } else {
@@ -40469,8 +40694,8 @@ function renderAndBlit(element, state, renderer) {
   if (currentDevWidth !== width || currentDevHeight !== height) {
     renderer.setSize(cssWidth, cssHeight, false);
   }
-  if (config.unifiedFrustum) applyUnifiedViewOffset(element, state.camera);
-  if (config.unifiedFrustum) updateUnifiedTranslation(element, state.portalGroup);
+  if (state.renderMode === "unified") applyUnifiedViewOffset(element, state.camera);
+  if (state.renderMode === "unified") updateUnifiedTranslation(element, state.portalGroup);
   renderer.render(state.scene, state.camera);
   const srcWidth = renderer.domElement.width;
   const srcHeight = renderer.domElement.height;
@@ -41182,8 +41407,8 @@ function applyFallback(el) {
         overflow: hidden;
         contain: strict;
       }
-      model > *:not(.__model-element-fallback-canvas-f7a9c3e1__):not(source),
-      model-polyfill > *:not(.__model-element-fallback-canvas-f7a9c3e1__):not(source) {
+      model > *:not(.__model-element-fallback-canvas-f7a9c3e1__):not(.__model-element-stereo-button-f7a9c3e1__):not(source),
+      model-polyfill > *:not(.__model-element-fallback-canvas-f7a9c3e1__):not(.__model-element-stereo-button-f7a9c3e1__):not(source) {
         display: none !important;
       }
     `;
